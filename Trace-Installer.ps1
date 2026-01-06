@@ -19,7 +19,7 @@
 #>
 
 param(
-    [Parameter(Mandatory=$true)]
+    [Parameter(Mandatory = $true)]
     [string]$InstallerPath,
 
     [string]$OutputPath = "Uninstall-App.ps1",
@@ -30,10 +30,20 @@ param(
 # --- Configuration ---
 $MonitoredHives = @("HKLM:\SOFTWARE", "HKCU:\Software")
 
-# Monitor the entire System Drive to capture changes in System32, specific app folders, etc.
+
+# Monitor the entire System Drive but exclude noisy system folders
 # Note: This can generate a high volume of events.
 $MonitoredPaths = @(
     "$env:SystemDrive\" 
+)
+
+# Paths to ignore events from (Starts With check)
+$IgnoredPaths = @(
+    "$env:SystemRoot\Temp",
+    "$env:SystemRoot\Prefetch",
+    "$env:SystemRoot\Logs",
+    "$env:SystemRoot\ServiceProfiles",
+    "$env:ProgramData\Microsoft\Windows\WER"
 )
 
 # --- Helper Functions ---
@@ -84,7 +94,7 @@ function Get-RegistrySnapshot {
                     
                     if ($ValueNames.Count -gt 0) {
                         foreach ($Name in $ValueNames) {
-                             $Values[$Name] = $CurrentKey.GetValue($Name, $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+                            $Values[$Name] = $CurrentKey.GetValue($Name, $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
                         }
                     }
                     $Snapshot[$CurrentPath] = $Values
@@ -93,10 +103,10 @@ function Get-RegistrySnapshot {
                     $SubKeyNames = $CurrentKey.GetSubKeyNames()
                     foreach ($Name in $SubKeyNames) {
                         try {
-                             $NextKey = $CurrentKey.OpenSubKey($Name, $false)
-                             if ($NextKey) {
-                                 $Queue.Enqueue(@{ Path = "$CurrentPath\$Name"; Key = $NextKey })
-                             }
+                            $NextKey = $CurrentKey.OpenSubKey($Name, $false)
+                            if ($NextKey) {
+                                $Queue.Enqueue(@{ Path = "$CurrentPath\$Name"; Key = $NextKey })
+                            }
                         }
                         catch { 
                             # Access denied to subkey
@@ -131,7 +141,7 @@ function Get-RegistrySnapshot {
 
 
 function Start-FileMonitoring {
-    param([string[]]$Paths)
+    param([string[]]$Paths, [string[]]$IgnoredPaths)
     Write-Host "Starting File System Monitoring..." -ForegroundColor Cyan
     
     # Thread-safe queue to store events from multiple watchers
@@ -141,25 +151,45 @@ function Start-FileMonitoring {
 
     # Action block for handling events
     $Action = {
-        $Queue = $Event.MessageData
-        $Sender = $Event.Sender
-        $EventArgs = $Event.SourceEventArgs
+        $Queue = $Event.MessageData.Queue
+        $Ignored = $Event.MessageData.IgnoredPaths
+        $SourceEventArgs = $Event.SourceEventArgs
         
-        $EventType = $EventArgs.ChangeType
-        $FullPath = $EventArgs.FullPath
-        $OldPath = $null
+        $EventType = $SourceEventArgs.ChangeType
+        $FullPath = $SourceEventArgs.FullPath
         
-        if ($EventType -eq 'Renamed') {
-            $OldPath = $EventArgs.OldFullPath
+        # Fast Noise Filtering
+        $Skip = $false
+        foreach ($Ignore in $Ignored) {
+            if ($FullPath.StartsWith($Ignore, [System.StringComparison]::OrdinalIgnoreCase)) {
+                $Skip = $true
+                break
+            }
         }
+        
+        if (-not $Skip) {
+            $OldPath = $null
+            if ($EventType -eq 'Renamed') {
+                $OldPath = $SourceEventArgs.OldFullPath
+            }
+            
+            $EventData = [PSCustomObject]@{
+                Timestamp = [DateTime]::Now
+                Type      = $EventType
+                Path      = $FullPath
+                OldPath   = $OldPath
+            }
+            $Queue.Enqueue($EventData)
+        }
+    }
 
-        $EventData = [PSCustomObject]@{
-            Timestamp = [DateTime]::Now
-            Type      = $EventType
-            Path      = $FullPath
-            OldPath   = $OldPath
+    # Error Action
+    $ErrorAction = {
+        $Exception = $Event.SourceEventArgs.GetException()
+        Write-Warning "FileSystemWatcher Error: $($Exception.Message)"
+        if ($Exception.GetType().Name -eq "InternalBufferOverflowException") {
+            Write-Warning "BUFFER OVERFLOW detected! Some file events were lost. Try increasing buffer size or reducing scope."
         }
-        $Queue.Enqueue($EventData)
     }
 
     foreach ($Path in $Paths) {
@@ -171,11 +201,18 @@ function Start-FileMonitoring {
                 $Watcher.IncludeSubdirectories = $true
                 $Watcher.InternalBufferSize = 65536 # 64KB buffer
                 
+                # Bundle data for the action
+                $MessageData = [PSCustomObject]@{
+                    Queue        = $EventQueue
+                    IgnoredPaths = $IgnoredPaths
+                }
+
                 # Register for specific events
-                $Subscribers += Register-ObjectEvent -InputObject $Watcher -EventName Created -Action $Action -MessageData $EventQueue
-                $Subscribers += Register-ObjectEvent -InputObject $Watcher -EventName Changed -Action $Action -MessageData $EventQueue
-                $Subscribers += Register-ObjectEvent -InputObject $Watcher -EventName Deleted -Action $Action -MessageData $EventQueue
-                $Subscribers += Register-ObjectEvent -InputObject $Watcher -EventName Renamed -Action $Action -MessageData $EventQueue
+                $Subscribers += Register-ObjectEvent -InputObject $Watcher -EventName Created -Action $Action -MessageData $MessageData
+                $Subscribers += Register-ObjectEvent -InputObject $Watcher -EventName Changed -Action $Action -MessageData $MessageData
+                $Subscribers += Register-ObjectEvent -InputObject $Watcher -EventName Deleted -Action $Action -MessageData $MessageData
+                $Subscribers += Register-ObjectEvent -InputObject $Watcher -EventName Renamed -Action $Action -MessageData $MessageData
+                $Subscribers += Register-ObjectEvent -InputObject $Watcher -EventName Error   -Action $ErrorAction -MessageData $MessageData
                 
                 $Watcher.EnableRaisingEvents = $true
                 $Watchers += $Watcher
@@ -187,9 +224,9 @@ function Start-FileMonitoring {
     }
     
     return [PSCustomObject]@{
-        Watchers = $Watchers
+        Watchers    = $Watchers
         Subscribers = $Subscribers
-        Queue = $EventQueue
+        Queue       = $EventQueue
     }
 }
 
@@ -259,39 +296,39 @@ function Compare-RegistrySnapshots {
                 # For byte arrays, -ne compares reference, so it defaults to "changed", which is safe (false positive).
                 
                 if (-not $PreValues.ContainsKey($ValName)) {
-                     $ModifiedValues.Add([PSCustomObject]@{
-                        Key = $Key
-                        ValueName = $ValName
-                        Value = $PostValues[$ValName]
-                    })
+                    $ModifiedValues.Add([PSCustomObject]@{
+                            Key       = $Key
+                            ValueName = $ValName
+                            Value     = $PostValues[$ValName]
+                        })
                 }
                 elseif ($null -eq $PreValues[$ValName]) {
-                     if ($null -ne $PostValues[$ValName]) {
+                    if ($null -ne $PostValues[$ValName]) {
                         $ModifiedValues.Add([PSCustomObject]@{
-                            Key = $Key
-                            ValueName = $ValName
-                            Value = $PostValues[$ValName]
-                        })
-                     }
+                                Key       = $Key
+                                ValueName = $ValName
+                                Value     = $PostValues[$ValName]
+                            })
+                    }
                 }
                 elseif ($PreValues[$ValName].GetType().IsArray) {
-                     # Simple array comparison
-                     $P = $PreValues[$ValName]
-                     $N = $PostValues[$ValName]
-                     if (($null -eq $N) -or ($P.Length -ne $N.Length) -or (Compare-Object $P $N -SyncWindow 0)) {
-                         $ModifiedValues.Add([PSCustomObject]@{
-                            Key = $Key
-                            ValueName = $ValName
-                            Value = $PostValues[$ValName]
-                        })
-                     }
+                    # Simple array comparison
+                    $P = $PreValues[$ValName]
+                    $N = $PostValues[$ValName]
+                    if (($null -eq $N) -or ($P.Length -ne $N.Length) -or (Compare-Object $P $N -SyncWindow 0)) {
+                        $ModifiedValues.Add([PSCustomObject]@{
+                                Key       = $Key
+                                ValueName = $ValName
+                                Value     = $PostValues[$ValName]
+                            })
+                    }
                 }
                 elseif ($PreValues[$ValName] -ne $PostValues[$ValName]) {
                     $ModifiedValues.Add([PSCustomObject]@{
-                        Key = $Key
-                        ValueName = $ValName
-                        Value = $PostValues[$ValName]
-                    })
+                            Key       = $Key
+                            ValueName = $ValName
+                            Value     = $PostValues[$ValName]
+                        })
                 }
             }
         }
@@ -308,7 +345,7 @@ function Compare-RegistrySnapshots {
     foreach ($Key in $PreKeys) {
         $pCounter++
         if ($pCounter % 10000 -eq 0) {
-             Write-Progress -Activity "Checking for Deleted Keys" -Status "$pCounter / $PreCount" -PercentComplete (($pCounter / $PreCount) * 100)
+            Write-Progress -Activity "Checking for Deleted Keys" -Status "$pCounter / $PreCount" -PercentComplete (($pCounter / $PreCount) * 100)
         }
         if (-not $Post.ContainsKey($Key)) {
             $DeletedKeys.Add($Key)
@@ -317,14 +354,14 @@ function Compare-RegistrySnapshots {
     Write-Progress -Activity "Checking for Deleted Keys" -Completed
     
     return @{
-        CreatedKeys = $CreatedKeys
-        DeletedKeys = $DeletedKeys
+        CreatedKeys    = $CreatedKeys
+        DeletedKeys    = $DeletedKeys
         ModifiedValues = $ModifiedValues
     }
 }
 
 
-function Generate-Uninstaller {
+function New-Uninstaller {
     param($FileEvents, $RegistryDiff, $OutputPath)
     Write-Host "Generating Uninstaller at $OutputPath..." -ForegroundColor Green
     
@@ -340,14 +377,54 @@ function Generate-Uninstaller {
 
     # --- Registry Removal ---
     $Sb.AppendLine("# --- Registry Cleanup ---") | Out-Null
+
+    $Sb.AppendLine(@"
+# Ensure explorer doesn't lock shell extensions
+Write-Host "Restarting Explorer to release locks..." -ForegroundColor Cyan
+Stop-Process -Name explorer -Force -ErrorAction SilentlyContinue
+Start-Sleep -Seconds 2
+"@) | Out-Null
     
-    # 1. remove created keys
-    # Sort by length descending to delete subkeys first
-    $KeysToDelete = $RegistryDiff.CreatedKeys | Sort-Object Length -Descending
-    foreach ($Key in $KeysToDelete) {
-        $Sb.AppendLine("Write-Host 'Removing Registry Key: $Key'") | Out-Null
-        $Sb.AppendLine("Remove-Item -Path '$Key' -Recurse -Force -ErrorAction SilentlyContinue") | Out-Null
+    # 1. remove created keys (Optimized to Root Trees)
+    # Optimization: Filter for root keys created during install
+    $CreatedKeys = $RegistryDiff.CreatedKeys | Sort-Object Length
+    $RootKeys = [System.Collections.Generic.List[string]]::new()
+    foreach ($key in $CreatedKeys) {
+        $isSub = $false
+        foreach ($root in $RootKeys) {
+            if ($key.StartsWith($root + "\", [System.StringComparison]::OrdinalIgnoreCase)) {
+                $isSub = $true
+                break
+            }
+        }
+        if (-not $isSub) { $RootKeys.Add($key) }
     }
+
+    $Sb.AppendLine("`$RegKeys = @(") | Out-Null
+    foreach ($k in $RootKeys) { $Sb.AppendLine("    '$($k -replace "'", "''")'") | Out-Null }
+    $Sb.AppendLine(")") | Out-Null
+
+    $Sb.AppendLine(@"
+Write-Host "Cleaning Registry ($($RootKeys.Count) root keys)..."
+foreach (`$key in `$RegKeys) {
+    Write-Host "Removing: `$key" -ForegroundColor Gray
+    # Only use slow safety timeout for shell extensions or if it's in a known sensitive area
+    if (`$key -match "ShellEx|ContextMenuHandlers|InprocServer32") {
+        `$job = Start-Job -ScriptBlock { param(`$path) Remove-Item -Path `$path -Recurse -Force } -ArgumentList `$key
+        if (`$job | Wait-Job -Timeout 5) {
+            Receive-Job `$job
+        } else {
+            Write-Warning "Timed out removing `$key. It might be locked."
+            Stop-Job `$job
+        }
+        Remove-Job `$job
+    } else {
+        Remove-Item -Path `$key -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+Write-Host "Restarting Explorer..." -ForegroundColor Cyan
+Start-Process explorer
+"@) | Out-Null
 
     # 2. Revert modified values
     foreach ($Mod in $RegistryDiff.ModifiedValues) {
@@ -358,24 +435,35 @@ function Generate-Uninstaller {
         $Sb.AppendLine("Write-Host 'Reverting Registry Value: $Key\$Name'") | Out-Null
         
         if ($Value -is [string]) {
-            # Escape single quotes in value
-            $SafeValue = $Value -replace "'", "''"
+            # Escape single quotes and handle potential carriage returns
+            $SafeValue = ($Value -replace "'", "''") -replace "`r", ""
             $Sb.AppendLine("Set-ItemProperty -Path '$Key' -Name '$Name' -Value '$SafeValue' -Force") | Out-Null
         }
         elseif ($Value -is [bool]) {
-             # Boolean needs $true/$false
-             $BoolStr = if ($Value) { "`$true" } else { "`$false" }
-             $Sb.AppendLine("Set-ItemProperty -Path '$Key' -Name '$Name' -Value $BoolStr -Force") | Out-Null
+            # Boolean needs $true/$false
+            $BoolStr = if ($Value) { "`$true" } else { "`$false" }
+            $Sb.AppendLine("Set-ItemProperty -Path '$Key' -Name '$Name' -Value $BoolStr -Force") | Out-Null
         }
         elseif ($Value.GetType().IsArray) {
-             # Array handling: Convert to @(v1, v2)
-             # Basic handling for numbers/bytes
-             $ValStr = ($Value | ForEach-Object { $_.ToString() }) -join ", "
-             $Sb.AppendLine("Set-ItemProperty -Path '$Key' -Name '$Name' -Value @($ValStr) -Force") | Out-Null
+            # Array handling: Convert to @('v1', 'v2')
+            $Elements = @()
+            foreach ($item in $Value) {
+                if ($null -eq $item) { continue }
+                if ($item -is [string]) {
+                    # Escape single quotes and wrap in single quotes
+                    $esc = ($item -replace "'", "''") -replace "`r", ""
+                    $Elements += "'$esc'"
+                }
+                else {
+                    $Elements += $item.ToString()
+                }
+            }
+            $ValStr = $Elements -join ", "
+            $Sb.AppendLine("Set-ItemProperty -Path '$Key' -Name '$Name' -Value @($ValStr) -Force") | Out-Null
         }
         else {
-             # For numbers, etc.
-             $Sb.AppendLine("Set-ItemProperty -Path '$Key' -Name '$Name' -Value $Value -Force") | Out-Null
+            # For numbers, etc.
+            $Sb.AppendLine("Set-ItemProperty -Path '$Key' -Name '$Name' -Value $Value -Force") | Out-Null
         }
     }
     $Sb.AppendLine("") | Out-Null
@@ -398,6 +486,19 @@ function Generate-Uninstaller {
 
     foreach ($Path in $AllPathsToRemove) {
         # Safety check: Don't delete C:\, C:\Windows, etc.
+        if ($Path -match "^[A-Za-z]:\\$" -or $Path -eq "$env:SystemRoot" -or $Path -eq "$env:SystemRoot\System32") {
+            Write-Warning "Skipping dangerous path removal: $Path"
+            continue 
+        }
+        
+        # Extra Safety: Check against important system folders
+        if ($Path.StartsWith("$env:SystemRoot\System32", [System.StringComparison]::OrdinalIgnoreCase) -and -not $Path.Contains("Bluebeam")) {
+            # If it's in System32 and doesn't explicitly look like it belongs to our app (heuristic), warn/comment out
+            $Sb.AppendLine("# WARNING: Safety Skip for System32 file (Manual Review Needed): $Path") | Out-Null
+            $Sb.AppendLine("# if (Test-Path '$Path') { Remove-Item -Path '$Path' -Force }") | Out-Null
+            continue
+        }
+
         if ($Path -match "^[A-Za-z]:\\$" -or $Path -eq "C:\Windows") {
             continue 
         }
@@ -421,7 +522,7 @@ try {
     $PreRegSnapshot = Get-RegistrySnapshot -Hives $MonitoredHives
 
     # 2. Start File Monitoring
-    $MonitoringContext = Start-FileMonitoring -Paths $MonitoredPaths
+    $MonitoringContext = Start-FileMonitoring -Paths $MonitoredPaths -IgnoredPaths $IgnoredPaths
 
     # 3. Launch Installer
     Write-Host "Launching Installer..." -ForegroundColor Yellow
@@ -430,18 +531,20 @@ try {
     
     if (Test-Path $InstallerPath -PathType Leaf) {
         if (-not [string]::IsNullOrWhiteSpace($InstallerArgs)) {
-             $Process = Start-Process -FilePath $InstallerPath -ArgumentList $InstallerArgs -PassThru
-        } else {
-             $Process = Start-Process -FilePath $InstallerPath -PassThru
+            $Process = Start-Process -FilePath $InstallerPath -ArgumentList $InstallerArgs -PassThru
+        }
+        else {
+            $Process = Start-Process -FilePath $InstallerPath -PassThru
         }
         Write-Host "Installer PID: $($Process.Id)" -ForegroundColor DarkGray
     }
     elseif ($Command) {
         # It's a command on the PATH
         if (-not [string]::IsNullOrWhiteSpace($InstallerArgs)) {
-             $Process = Start-Process -FilePath $InstallerPath -ArgumentList $InstallerArgs -PassThru
-        } else {
-             $Process = Start-Process -FilePath $InstallerPath -PassThru
+            $Process = Start-Process -FilePath $InstallerPath -ArgumentList $InstallerArgs -PassThru
+        }
+        else {
+            $Process = Start-Process -FilePath $InstallerPath -PassThru
         }
         Write-Host "Installer PID: $($Process.Id)" -ForegroundColor DarkGray
     }
@@ -451,7 +554,7 @@ try {
 
     if ($Process) {
         if ($Process.HasExited) {
-             Write-Host "Installer exited immediately." -ForegroundColor Yellow
+            Write-Host "Installer exited immediately." -ForegroundColor Yellow
         }
         
         if ($AutoExit) {
@@ -464,7 +567,7 @@ try {
         }
     }
     else {
-         Read-Host "Press Enter to stop tracing (Installer execution failed or skipped)"
+        Read-Host "Press Enter to stop tracing (Installer execution failed or skipped)"
     }
 
     # 4. Stop File Monitoring
@@ -477,7 +580,7 @@ try {
     $RegistryDiff = Compare-RegistrySnapshots -Pre $PreRegSnapshot -Post $PostRegSnapshot
 
     # 7. Generate Script
-    Generate-Uninstaller -FileEvents $FileEvents -RegistryDiff $RegistryDiff -OutputPath $OutputPath
+    New-Uninstaller -FileEvents $FileEvents -RegistryDiff $RegistryDiff -OutputPath $OutputPath
 
     Write-Host "Done." -ForegroundColor Green
 }
