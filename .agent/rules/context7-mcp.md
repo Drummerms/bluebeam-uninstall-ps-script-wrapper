@@ -1,4 +1,6 @@
----
+﻿---
+name: Context-First Code Generation via Context7
+description: Enforces the use of Context7 before code generation or modification.
 trigger: always_on
 ---
 

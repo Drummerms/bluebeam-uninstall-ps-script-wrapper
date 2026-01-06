@@ -1,4 +1,6 @@
----
+﻿---
+name: Token-Efficient Memory Management via MCP
+description: Directs the agent to prioritize the Memory MCP tool for project context.
 trigger: always_on
 ---
 
